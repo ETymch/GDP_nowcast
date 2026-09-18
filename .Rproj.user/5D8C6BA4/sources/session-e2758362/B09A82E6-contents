@@ -1,0 +1,1374 @@
+---
+title: "Сезонная корректировка данных"
+author: "Е. Тымченко"
+date: 2026-06-03
+categories: ["R", "Python", "Julia", "Временные ряды"]
+tags: ["Сезонность", "X13", "STL", "Prophet"]
+description: "X-13, STL и Prophet на одном ряде: как сезонно корректировать данные в R, Python и Julia."
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Код"
+    code-tools: true
+    fig-width: 9
+    fig-height: 4.5
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+# 1. Python сначала — до загрузки R arrow (конфликт DLL на Windows)
+library(reticulate)
+use_python("C:/Users/evgen/miniconda3/python.exe", required = TRUE)
+py_run_string("
+import pyarrow
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from statsmodels.tsa.seasonal import STL, MSTL
+from statsmodels.tsa.deterministic import DeterministicProcess, Fourier
+from statsmodels.tsa.arima.model import ARIMA
+import statsmodels.api as sm
+import openpyxl
+")
+
+# 2. R-пакеты (включая arrow)
+library(tidyverse)
+library(arrow)
+library(readxl)
+library(seasonal)
+library(forecast)
+library(patchwork)
+
+# 3. Данные для Julia и X13
+read_excel("data_alcohol_2105.xlsx") %>%
+  filter(mOKATO == "Российская Федерация", Good == "Пиво") %>%
+  arrange(Date) %>%
+  select(Date, Retail) %>%
+  write_csv("_beer_rf.csv")
+
+if (!file.exists("_seasonality.csv")) {
+  tf_seas <- tempfile(fileext = ".xlsx")
+  download.file(
+    "https://raw.githubusercontent.com/ETymch/Econometrics_2023/main/Datasets/data_seasonality.xlsx",
+    destfile = tf_seas, mode = "wb", quiet = TRUE
+  )
+  read_excel(tf_seas) %>%
+    mutate(Date = as.Date(Date)) %>%
+    filter(Date >= "2013-01-01") %>%
+    arrange(Date) %>%
+    write_csv("_seasonality.csv")
+}
+
+source("x13_calendar.R", local = globalenv())
+
+# 5. Julia — после X13 (seas() вызывает внешний бинарник через system())
+library(JuliaCall)
+Sys.setenv(JULIA_HOME = "C:/Users/evgen/AppData/Local/Programs/Julia-1.11.5/bin")
+julia_setup(installJulia = FALSE)
+```
+
+```{python}
+#| label: py-setup
+#| message: false
+# Все пакеты уже загружены в R setup chunk (до julia_setup)
+# Здесь только проверка
+import sys
+```
+
+```{julia}
+#| label: jl-setup
+#| message: false
+using Parquet2, DataFrames, CSV, Plots, GLM, Statistics, Dates, LinearAlgebra
+using StateSpaceModels
+gr()
+```
+
+Почти любой временной ряд в экономике (и не только) несёт в себе сезонность. Например, розничные продажи обычно растут в декабре; потребление электроэнергии бьёт рекорды в зимние периоды и жарким летом. Сезонные колебания сложно отделить от изменений тренда и экономического цикла и провести качественный анализ.
+
+Сезонная корректировка — набор методов, которые помогают выделить основные компоненты временного ряда. Это базовый инструмент любого современного анализа, как в прикладной микро, так и в макроэкономике.
+
+## 1. Компоненты временного ряда
+
+Стандартная аддитивная модель разбивает временной ряд $Y_t$ на четыре части:
+
+$$Y_t = T_t + S_t + C_t + \varepsilon_t,$$
+
+где:
+
+- $T_t$ — **тренд**: долгосрочная направленная динамика.
+- $S_t$ — **сезонная компонента**: регулярные колебания с известным периодом (год, квартал, неделя).
+- $C_t$ — **цикл**: нерегулярные волны продолжительностью несколько лет (деловой цикл).
+- $\varepsilon_t$ — **нерегулярная компонента**: всё остальное, включая выбросы и случайный шум.
+
+Если размах сезонных колебаний пропорционален уровню ряда, переходят к **мультипликативной модели**: $Y_t = T_t \cdot S_t \cdot C_t \cdot \varepsilon_t$, что эквивалентно аддитивной модели для $\log Y_t$.
+
+### 1.1 Сезонность температуры
+
+Дневная температура в российских городах — идеальная иллюстрация сезонности. Тренда почти нет, цикл слабый, зато сезонный ритм занимает почти весь диапазон колебаний.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-temp
+#| fig-cap: "Среднесуточная температура в Нижнем Новгороде и Хабаровске (2017–2026)"
+
+read_parquet("data_temp.parquet") %>%
+  filter(town %in% c("Нижний Новгород", "Хабаровск")) %>%
+  select(time, temp, town) %>%
+  ggplot(aes(x = time, y = temp, color = town)) +
+  geom_line(linewidth = 0.3, alpha = 0.8) +
+  scale_x_datetime(date_breaks = "1 year", date_labels = "%Y") +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "°C")
+```
+
+#### Python
+
+```{python}
+#| label: fig-temp-py
+#| fig-cap: "Среднесуточная температура в Нижнем Новгороде и Хабаровске (2017–2026)"
+
+cities = ["Нижний Новгород", "Хабаровск"]
+sub = (pd.read_parquet("data_temp.parquet")
+       .query("town in @cities")
+       [["time", "temp", "town"]]
+       .assign(time=lambda d: pd.to_datetime(d["time"]))
+       .sort_values("time"))
+
+fig, ax = plt.subplots(figsize=(10, 4))
+for city in cities:
+    d = sub[sub["town"] == city]
+    ax.plot(d["time"], d["temp"], lw=0.3, alpha=0.8, label=city)
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.set_ylabel("°C")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-temp-jl
+#| fig-cap: "Среднесуточная температура в Нижнем Новгороде и Хабаровске (2017–2026)"
+
+begin
+
+  cities_jl = ["Нижний Новгород", "Хабаровск"]
+  temp_jl = copy(DataFrame(Parquet2.Dataset("data_temp.parquet")))
+  filter!(r -> r.town in cities_jl && !ismissing(r.time) && !ismissing(r.temp), temp_jl)
+  sort!(temp_jl, :time)
+  
+  p = plot(ylabel="°C", legend=:topright, size=(800, 600))
+  for city in cities_jl
+      g = filter(r -> r.town == city, temp_jl)
+      plot!(p, Date.(g.time), Float64.(g.temp); lw=0.3, alpha=0.8, label=city)
+  end
+  p
+
+end
+```
+
+:::
+
+В Хабаровске амплитуда около 65°C — от −30°C зимой до +35°C летом. В Нижнем Новгороде — около 45°C. Тренда практически нет — сезонность здесь и есть главная история.
+
+### 1.2 Сезонность в экономических данных
+
+В экономике сезонность тоньше. Возьмём розничные продажи пива в России (квартальные данные, млн руб.). Летний пик хорошо заметен, но на фоне тренда и шума выглядит скромнее, чем в примере с температурой.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-beer
+#| fig-cap: "Розничные продажи пива, млн руб. (квартальные данные)"
+
+read_excel("data_alcohol_2105.xlsx") %>%
+  filter(mOKATO == "Российская Федерация", Good == "Пиво") %>%
+  mutate(Date = as_date(Date)) %>%
+  ggplot(aes(x = Date, y = Retail)) +
+  geom_line(colour = "#E08214", linewidth = 0.8) +
+  geom_point(colour = "#E08214", size = 1.8) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "млн руб.")
+```
+
+#### Python
+
+```{python}
+#| label: fig-beer-py
+#| fig-cap: "Розничные продажи пива (Python)"
+
+beer_py = (pd.read_excel("data_alcohol_2105.xlsx", parse_dates=["Date"])
+           .query("mOKATO == 'Российская Федерация' and Good == 'Пиво'"))
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(beer_py["Date"], beer_py["Retail"],
+        color="#E08214", lw=0.9, marker="o", ms=3)
+ax.set_ylabel("млн руб.")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+fig.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-beer-jl
+#| fig-cap: "Розничные продажи пива (Julia)"
+
+begin
+
+  beer_jl = CSV.read("_beer_rf.csv", DataFrame);
+  beer_jl.Date = DateTime.(replace.(beer_jl.Date, "Z" => ""))
+  sort!(beer_jl, :Date)
+  
+  plot(beer_jl.Date, beer_jl.Retail;
+       lw=0.8, color="#E08214", marker=:circle, markersize=3,
+       xlabel="", ylabel="млн руб.", legend=false, size=(800, 600))
+
+end
+```
+
+:::
+
+Третий квартал (лето) — стабильный пик, первый (зима) и второй (весна) — ниже. Паттерн повторяется из года в года, но немного меняется — деловой цикл и тренд роста продаж накладываются на сезонность. Именно такие «живые» паттерны и сложнее всего корректировать.
+
+---
+
+## 2. Разложение STL
+
+**STL** (Seasonal-Trend decomposition using LOESS) — метод декомпозиции временных рядов, предложенный в работе [Cleveland et al. (1990)](https://www.scb.se/contentassets/ca21efb41fee47d293bbee5bf7be7fb3/stl-a-seasonal-trend-decomposition-procedure-based-on-loess.pdf). Тренд и сезонная компонента оцениваются методом локально-полиномиальной регрессии (LOESS), итеративно уточняясь друг через друга.
+
+**Что такое LOESS.** Нам нужна гладкая линия через данные — но не одна на весь ряд, а отдельная прямая в каждой точке $t$. В точке $t$ она должна хорошо описывать **ближайшие** наблюдения и почти игнорировать далёкие. Интуиция: тренд января 2020 лучше определяется соседними месяцами, чем данными за 2013 год.
+
+Формально, для каждой точки $t = 1, \ldots, T$ решаем задачу взвешенного МНК — находим параметры $(a_0, a_1)$ прямой, которая минимально отклоняется от наблюдённых пар $(\tau,\, y_\tau)$, причём отдалённые наблюдения входят с меньшим весом:
+
+$$\min_{a_0,\, a_1} \sum_{\tau=1}^{T} w_{\tau,t}\; \bigl(y_\tau - a_0 - a_1\,(\tau - t)\bigr)^2.$$
+
+Здесь $y_\tau$ — наблюдаемое значение в момент $\tau$, а выражение $a_0 + a_1(\tau - t)$ — значение прямой в $\tau$ (записано через отклонение от $t$, так что при $\tau = t$ прямая равна $a_0$). Сглаженная оценка в точке $t$ — это $\hat{a}_0$.
+
+Веса $w_{\tau,t}$ убывают по мере удаления $\tau$ от $t$:
+
+$$w_{\tau,t} = \begin{cases}\left(1 - \left(\dfrac{|\tau - t|}{h}\right)^3\right)^3, & |\tau - t| < h,\\[6pt] 0, & |\tau - t| \geq h. \end{cases}$$
+
+При $\tau = t$ вес максимален (равен 1). По мере удаления $\tau$ от $t$ вес плавно убывает и при $|\tau - t| = h$ достигает нуля. За пределами окна наблюдение полностью исключается. Явное обнуление при $|\tau - t| \geq h$ необходимо: без него формула в скобках стала бы отрицательной и веса потеряли бы смысл.
+
+Параметр $h$ — ширина окна локальной регрессии. В `stl()` он задаётся через `s.window` (для сезонного шага) и `t.window` (для тренда). Узкое окно — кривая цепляется за шум; широкое — сглаживает сильнее:
+
+![Как меняется LOESS при росте ширины окна $h$](loess_h.gif){width=85% fig-align="center"}
+
+В Julia задача взвешенного МНК записывается буквально — формула переносится в код один-к-одному:
+
+```{julia}
+#| label: loess-def
+#| code-fold: false
+
+begin
+
+    # Трёхкубная весовая функция:
+    # максимальный вес (=1) в центре окна и плавное убывание до 0 на расстоянии h
+    tricube(d, h) = d < h ? (1 - (d/h)^3)^3 : 0.0
+
+    # Локальная линейная регрессия (LOESS) для одной точки t.
+    # Возвращает сглажённое значение ряда в позиции t.
+    function loess_point(y::AbstractVector, t::Int; h::Int)
+
+        τ = eachindex(y)
+
+        # Вес каждой точки зависит от расстояния до t:
+        # ближайшие наблюдения влияют сильнее, дальние слабее.
+        w = tricube.(abs.(τ .- t), h)
+
+        # Дизайн-матрица локальной модели:
+        # y ≈ β₀ + β₁(τ - t)
+        # Центрирование по t позволяет получить прогноз в точке t как β₀.
+        X = [ones(length(y))  (τ .- t)]
+
+        # Диагональная матрица весов для взвешенного МНК.
+        W = Diagonal(w)
+
+        # Коэффициенты взвешенной регрессии:
+        # β = (X'WX)^(-1) X'Wy
+        # Запись через "\" численно устойчивее,
+        # чем явное вычисление обратной матрицы.
+        β = (X' * W * X) \ (X' * W * y)
+
+        # Поскольку модель центрирована по t,
+        # сглаженное значение в точке t равно β₀.
+        β[1]
+    end
+
+    # Вычислить LOESS для всех точек ряда.
+    # По умолчанию используется окно шириной 75% длины ряда.
+    loess(y; h = ceil(Int, 0.75 * length(y))) =
+        [loess_point(y, t; h=h) for t in eachindex(y)]
+
+end
+```
+
+### 2.1 Алгоритм
+
+STL ищет разложение $Y_t = T_t + S_t + \varepsilon_t$: тренд, сезонность и остаток. Обе компоненты — $T_t$ и $S_t$ — оцениваются через LOESS, и на каждом шаге одна уточняется с учётом другой.
+
+**Старт.** Сначала предпологаем, что тренда нет: $T_t^{(0)} = 0$.
+
+**Запускаем цикл** 5-15 раз:
+
+1. **Убираем тренд.** $D_t = Y_t - T_t$. Вычитаем тренд из ряда.
+2. **Оцениваем сезонность.** Ряд режем на $s$ сезонов по календарю. Для квартальных данных: берём все 1-е кварталы, выделяем для них тренд, все вторые кварталы, выделяем для них тренд. Потом склеиваем всё в единую сезонность $S_t$.
+3. **Убираем тренд из сезонности.** Широкий LOESS по всей $S_t$ ловит медленный дрейф («лето с каждым годом всё выше»). Вычитаем его: сезонность колеблется вокруг нуля, не тащит за собой рост продаж.
+4. **Переоцениваем тренд.** LOESS по ряду $Y_t - S_t$ → новый $T_t$.
+
+Шаги 1–4 повторяются: сначала сезонность оценена грубо (тренд ещё нулевой), затем тренд уточняется, затем сезонность снова — и так далее, пока $T_t$ и $S_t$ не стабилизируются.
+
+**Остаток:** $\varepsilon_t = Y_t - T_t - S_t$.
+
+В полной реализации `stl()` есть ещё **робастный цикл** (`robust = TRUE`): наблюдения с большими остатками получают малый вес, внутренний цикл перезапускается. В `stl_manual` ниже он не реализован — для учебного примера достаточно итераций `K`.
+
+| Параметр в `stl_manual` | Аналог в `stl()` | Смысл |
+|---|---|---|
+| `s` | период сезонности | Число слотов: 4 для квартальных, 12 для месячных |
+| `s_win` | `s.window` | Ширина окна LOESS внутри каждого слота. Меньше — сезонность гибче меняется от года к году |
+| `t_win` | `t.window` | Ширина окна LOESS для тренда. Больше — тренд плавнее |
+| `K` | число внутренних итераций | Сколько раз повторить шаги 1–4 |
+
+### 2.2 Пример: продажи пива
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-stl-beer
+#| fig-cap: "STL-разложение: розничные продажи пива"
+#| fig-height: 6
+
+beer_ts <- read_excel("data_alcohol_2105.xlsx") %>%
+  filter(mOKATO == "Российская Федерация", Good == "Пиво") %>%
+  arrange(Date) %>%
+  pull(Retail) %>%
+  ts(start = c(2017, 1), frequency = 4)
+
+stl(beer_ts, s.window = 7, robust = TRUE) %>%
+  autoplot() +
+  theme_minimal(base_size = 11) +
+  labs(title = NULL)
+```
+
+#### Python
+
+```{python}
+#| label: fig-stl-beer-py
+#| fig-cap: "STL-разложение (Python)"
+#| fig-height: 6
+
+beer_py2 = (pd.read_excel("data_alcohol_2105.xlsx", parse_dates=["Date"])
+            .query("mOKATO == 'Российская Федерация' and Good == 'Пиво'"))
+beer_ts_py = beer_py2.set_index("Date")["Retail"].asfreq("QS")
+
+stl_result = STL(beer_ts_py, period=4, seasonal=7, robust=True).fit()
+fig = stl_result.plot()
+fig.set_size_inches(10, 6)
+plt.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-stl-beer-jl
+#| fig-cap: "STL-разложение: реализация LOESS из первых принципов (Julia)"
+#| fig-height: 6
+
+begin
+
+  # Итеративная STL с LOESS, определённым выше
+function stl_manual(y::AbstractVector;
+                    s     = 4,   # период сезонности
+                    t_win = 4,   # окно тренда
+                    s_win = 7,   # окно сезонности
+                    K     = 2)   # число итераций
+
+    n = length(y)
+
+    trend    = zeros(n)
+    seasonal = zeros(n)
+
+    for k in 1:K
+
+        # 1. Детрендирование
+        detrended = y .- trend
+
+        # 2. Оценка сезонности
+        for season in 1:s
+
+            idx = season:s:n
+
+            seasonal[idx] .= loess(
+                detrended[idx];
+                h = s_win
+            )
+        end
+
+        # 3. Центрирование сезонности
+        seasonal_mean = loess(
+            seasonal;
+            h = ceil(Int, 0.75n)
+        )
+
+        seasonal .-= seasonal_mean
+
+        # 4. Переоценка тренда
+        trend = loess(
+            y .- seasonal;
+            h = t_win
+        )
+    end
+
+    residual = y .- trend .- seasonal
+
+    (
+        trend    = trend,
+        seasonal = seasonal,
+        residual = residual
+    )
+end
+  
+  y_beer = Float64.(beer_jl.Retail ./ 10^3)
+  
+  decomp = stl_manual(y_beer;
+					  s=4, # квартальные данные
+					  t_win=4, # тренд меняется относительно часто
+					  s_win=20, # сезонность меняется относительно редко
+					  K = 10 # 10 итераций
+					 )
+  
+  l = @layout [a; b; c; d]
+  p1 = plot(beer_jl.Date, y_beer;          lw=0.8, color=:gray50,   title="Исходный",    legend=false, ylabel="млрд руб.")
+  p2 = plot(beer_jl.Date, decomp.trend;    lw=1.0, color="#2C7BB6", title="Тренд",       legend=false, ylabel="млрд руб.")
+  p3 = plot(beer_jl.Date, decomp.seasonal; lw=0.8, color="#4DAC26", title="Сезонность",  legend=false, ylabel="млрд руб.")
+  p4 = plot(beer_jl.Date, decomp.residual; lw=0.6, color=:gray40,   title="Остаток",     legend=false, ylabel="млрд руб.")
+  plot(p1, p2, p3, p4; layout=l, size=(900, 650), left_margin=5Plots.mm, bottom_margin=2Plots.mm)
+
+end
+```
+
+:::
+
+На графике четыре панели: исходный ряд, тренд, сезонность, остаток. Сезонная компонента подтверждает летний пик. Обратите внимание: к концу периода амплитуда сезонных колебаний слегка снизилась — `s.window = 7` позволяет ей меняться со временем.
+
+### 2.3 Ограничения STL
+
+STL — хорошая отправная точка, но для прикладного анализа его не всегда хватает.
+
+**Симметричный фильтр и проблема краёв.** LOESS использует данные слева и справа от точки оценки. На концах ряда (последние несколько наблюдений) фильтр вынужден экстраполировать — оценки тренда и сезонности на краях ненадёжны. Для анализа в реальном времени это существенный недостаток.
+
+**Нет стохастической модели для сезонности.** STL не предполагает, что $S_t$ является реализацией какого-либо случайного процесса. Это значит, что оценить неопределённость сезонной компоненты или корректно строить прогнозы с учётом эволюции сезонности нельзя.
+
+**Нет учёта производственного календаря.** Январь в России — 8–10 выходных дней. Май — тоже. Такие «скачки» связаны не с сезонностью в обычном смысле, а с календарём рабочих дней. STL не умеет их отдельно учитывать.
+
+**Нет преобразований и обработки выбросов встроенных в модель.** Для логарифмирования или трансформации Бокса-Кокса нужно делать это вручную. Выбросы влияют на оценку (`robust = TRUE` помогает, но не идеально).
+
+Для преодоления этих проблем разработаны X11 и X13-ARIMA-SEATS.
+
+---
+
+## 3. X11 и X13-ARIMA-SEATS
+
+X11 — метод, разработанный в Бюро переписи населения США в 1960-х годах. Идея: заменить единственный LOESS-проход серией итеративных симметричных скользящих средних, которые последовательно уточняют тренд и сезонность. X13-ARIMA-SEATS — современный наследник X11, добавляющий предварительную ARIMA-фильтрацию и альтернативный метод декомпозиции SEATS.
+
+### 3.1 Почему сезонность — это MA-процесс
+
+Детерминированный взгляд на сезонность: добавить в модель 11 сезонных фиктивных переменных (для 12 месяцев). Тогда $S_t$ — линейная комбинация этих переменных с фиксированными коэффициентами. Минус: паттерн жёстко зафиксирован навсегда. В реальных данных сезонность медленно меняется — декабрьский скачок потребления усиливается с развитием торговли, июльский провал в промышленности смягчается с изменением структуры экономики.
+
+**Стохастическая модель сезонности** (Harvey, 1989) допускает эволюцию: сезонная компонента $S_t$ устроена так, что за любой полный период она суммируется примерно в ноль:
+
+$$S_t + S_{t-1} + \ldots + S_{t-s+1} = \omega_t, \qquad \omega_t \sim \mathcal{N}(0,\, \sigma^2_\omega).$$
+
+При $\sigma^2_\omega = 0$ — это классические неизменные фиктивные переменные. При $\sigma^2_\omega > 0$ сезонные коэффициенты могут медленно плыть. В операторном виде это записывается как
+
+$$\underbrace{(1 + B + B^2 + \ldots + B^{s-1})}_{S(B)} S_t = \omega_t,$$
+
+где $B$ — оператор лага. Уравнение $S(B) S_t = \omega_t$ задаёт авторегрессионный процесс — решённый «наперёд» относительно инноваций $\omega$, он оказывается MA$(s-1)$. Иными словами, каждый сезонный коэффициент — это взвешенное скользящее среднее последних $s-1$ инноваций.
+
+**Базовая структурная модель (Basic Structural Model, Harvey 1989)** записывает все компоненты в единой State Space форме.
+
+*Тренд* — локальный линейный тренд с двумя уравнениями:
+
+$$\mu_t = \mu_{t-1} + \beta_{t-1} + \eta_t, \qquad \eta_t \sim \mathcal{N}(0,\,\sigma^2_\eta),$$
+$$\beta_t = \beta_{t-1} + \zeta_t, \qquad \zeta_t \sim \mathcal{N}(0,\,\sigma^2_\zeta),$$
+
+где $\mu_t$ — уровень, $\beta_t$ — угол наклона. При $\sigma^2_\zeta = 0$ наклон постоянен; при $\sigma^2_\eta = \sigma^2_\zeta = 0$ — детерминированный линейный тренд.
+
+*Сезонность* — стохастические сезонные эффекты:
+
+$$\gamma_t = -\gamma_{t-1} - \gamma_{t-2} - \cdots - \gamma_{t-s+1} + \omega_t, \qquad \omega_t \sim \mathcal{N}(0,\,\sigma^2_\omega).$$
+
+*Уравнение наблюдения:*
+
+$$y_t = \mu_t + \gamma_t + \varepsilon_t, \qquad \varepsilon_t \sim \mathcal{N}(0,\,\sigma^2_\varepsilon).$$
+
+Полный вектор состояния $\alpha_t = (\mu_t,\; \beta_t,\; \gamma_t,\; \gamma_{t-1},\; \ldots,\; \gamma_{t-s+2})'$ подчиняется уравнению перехода (state transition) $\alpha_t = T\,\alpha_{t-1} + R\,\varepsilon^*_t$, где
+
+$$T = \begin{pmatrix}
+1 & 1 & 0 & 0 & \cdots & 0 \\
+0 & 1 & 0 & 0 & \cdots & 0 \\
+0 & 0 & -1 & -1 & \cdots & -1 \\
+0 & 0 & 1 & 0 & \cdots & 0 \\
+\vdots & & & \ddots & & \vdots \\
+0 & 0 & 0 & \cdots & 1 & 0
+\end{pmatrix}, \qquad
+R = \begin{pmatrix}1 & 0 & 0 \\ 0 & 1 & 0 \\ 0 & 0 & 1 \\ 0 & 0 & 0 \\ \vdots \\ 0 & 0 & 0\end{pmatrix},$$
+
+$\varepsilon^*_t = (\eta_t, \zeta_t, \omega_t)'$, а уравнение наблюдения: $y_t = Z\,\alpha_t + \varepsilon_t$, $Z = (1,\; 0,\; 1,\; 0,\; \ldots,\; 0)$. Модель оценивается фильтром Калмана.
+
+**Простой пример: квартальные данные ($s = 4$), без наклона.** Состояние сокращается до $\alpha_t = (\mu_t,\; \gamma_t,\; \gamma_{t-1},\; \gamma_{t-2})'$. Допустим, в первых трёх кварталах оценили сезонные эффекты: $\gamma_1 = -4$ (зима), $\gamma_2 = +6$ (лето), $\gamma_3 = +1$ (осень). Тогда четвёртый квартал:
+
+$$\gamma_4 = -\gamma_3 - \gamma_2 - \gamma_1 + \omega_4 = -1 - 6 + 4 + \omega_4 = -3 + \omega_4.$$
+
+При $\sigma^2_\omega = 0$ сумма за год строго равна нулю: $-4 + 6 + 1 + (-3) = 0$. При $\sigma^2_\omega > 0$ эта сумма может слегка отклоняться, и паттерн медленно эволюционирует от года к году.
+
+Именно на этой логике построен SEATS — алгоритм, входящий в X13-ARIMA-SEATS. Гиперпараметры $\sigma^2_\eta, \sigma^2_\zeta, \sigma^2_\omega, \sigma^2_\varepsilon$ оцениваются по данным (MLE через фильтр Калмана), тогда как X11 не предполагает никакой явной модели.
+
+### 3.2 X11: итеративные скользящие средние
+
+В X11 ни ARIMA, ни State Space явно не используются. Метод итеративно применяет симметричные скользящие средние, попеременно оценивая тренд и сезонность.
+
+*Первый проход:*
+1. Из ряда $Y_t$ удаляем грубый тренд с помощью 2×12-MA (для месячных данных): $\hat{T}_t^{(1)}$.
+2. Из разности $Y_t - \hat{T}_t^{(1)}$ выделяем сезонность: для каждого «слота» применяем 3×3-MA по смежным годам → $\hat{S}_t^{(1)}$.
+3. Нормируем сезонность, чтобы сумма за год равнялась нулю.
+
+*Второй проход:* аналогично, но уже с более тонким фильтром Henderson MA для тренда.
+
+Результат — сезонно скорректированный ряд $SA_t = Y_t - \hat{S}_t$ и разложение на компоненты. Итеративная симметрия фильтров гарантирует, что нет систематического смещения — именно то свойство, которое требуется от «официальной» статистики.
+
+### 3.3 X13-ARIMA-SEATS на практике
+
+В R пакет `seasonal` автоматически вызывает официальный исполняемый файл X13-ARIMA-SEATS (Census Bureau). В Python `statsmodels` предоставляет STL как приближение. В Julia пакет `StateSpaceModels.jl` реализует BSM напрямую — без обёртки вокруг внешнего бинарника.
+
+Для иллюстрации загружаем индекс промышленного производства России (2013–2024, база = 2016 г.):
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-x13
+#| fig-cap: "Промышленное производство: исходный ряд и X13-SA"
+#| message: false
+#| warning: false
+
+tibble(
+  date  = seq(as_date("2013-01-01"), by = "month", length.out = length(prom_raw)),
+  raw   = as.numeric(prom_raw),
+  SEATS = as.numeric(prom_seats),
+  X11   = as.numeric(prom_x11)
+) %>%
+  pivot_longer(-date, names_to = "series") %>%
+  ggplot(aes(x = date, y = value, colour = series, linewidth = series)) +
+  geom_line() +
+  scale_linewidth_manual(values = c(raw = 0.4, SEATS = 0.9, X11 = 0.9)) +
+  scale_colour_manual(values = c(raw = "grey60", SEATS = "#2C7BB6", X11 = "#D7191C")) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "log(ИПП)", colour = NULL, linewidth = NULL)
+```
+
+#### Python
+
+```{python}
+#| label: fig-x13-py
+#| fig-cap: "Промышленное производство: STL как аналог SA (Python)"
+
+df_seas = pd.read_csv("_seasonality.csv", parse_dates=["Date"])
+df_seas = df_seas[df_seas["Date"] >= "2013-01-01"].copy()
+df_seas["log_prom"] = np.log(df_seas["Prom_M"])
+
+prom_ts_py = df_seas.set_index("Date")["log_prom"].asfreq("MS")
+stl_res = STL(prom_ts_py, period=12, seasonal=13, robust=True).fit()
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(prom_ts_py.index, prom_ts_py.values, lw=0.5, color="grey", label="Исходный")
+ax.plot(prom_ts_py.index, stl_res.trend + stl_res.resid, lw=1.0,
+        color="#2C7BB6", label="STL SA")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator(2))
+ax.legend()
+ax.set_ylabel("log(ИПП)")
+fig.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-x13-jl
+#| fig-cap: "Промышленное производство: BSM из StateSpaceModels.jl (Julia)"
+#| message: false
+#| warning: false
+
+begin
+
+  data_seas_jl = CSV.read("_seasonality.csv", DataFrame; dateformat="yyyy-mm-dd")
+  sort!(data_seas_jl, :Date)
+  
+  y_prom = log.(Float64.(data_seas_jl.Prom_M))
+  
+  # BSM: уровень + наклон + стохастическая сезонность (период 12)
+  # StateSpaceModels.jl: BasicStructural(y, seasonality)
+  model_bsm = BasicStructural(y_prom, 12)
+  StateSpaceModels.fit!(model_bsm)
+  
+  ss = kalman_smoother(model_bsm)
+  # alpha — Vector{Vector{Float64}}: alpha[t] — вектор состояния в момент t
+  # Структура: [уровень, наклон, γ_t, γ_{t-1}, ..., γ_{t-10}]
+  seasonal_bsm = getindex.(ss.alpha, 3)   # γ_t для каждого t
+  sa_bsm = y_prom .- seasonal_bsm
+  
+  plot(data_seas_jl.Date,
+       [y_prom sa_bsm];
+       label=["Исходный" "BSM SA"],
+       lw=[0.4 0.9],
+       color=["grey60" "#2C7BB6"],
+       alpha=[0.8 1.0],
+       ylabel="log(ИПП)",
+       legend=:bottomleft,
+       size=(800, 600))
+
+end
+```
+
+:::
+
+SEATS и X11 дают очень близкие результаты — расхождения видны только в периоды структурных сдвигов (2014–2015, 2022). SEATS опирается на явную оптимальную фильтрацию в рамках ARIMA-модели; X11 менее параметричен, но исторически хорошо проверен. Julia-вариант через BSM даёт результат, близкий к SEATS: оба метода оценивают одну и ту же стохастическую модель максимального правдоподобия.
+
+---
+
+## 4. X11 и производственный календарь
+
+### 4.1 Проблема
+
+В России январь — нерабочий месяц примерно на треть: официально 8–10 праздничных дней. Май — ещё 3–5. С точки зрения сезонной корректировки это «аномальные» месяцы: их низкое значение объясняется не сезонностью как таковой, а просто тем, что заводы не работали.
+
+Если не учитывать производственный календарь, алгоритм приписывает эту «пустоту» сезонной компоненте. Год от года число праздничных дней может меняться и это вносит дополнительный шум в рузультаты сезонной корректировки.
+
+Правильная стратегия: добавить в регрессионный блок X13 регрессор «доля праздничных дней в месяце» и дать алгоритму отделить этот эффект от обычной сезонности.
+
+### 4.2 Файл с датами праздников
+
+Производственный календарь — это просто **список нерабочих дней**. Для иллюстрации используем файл `russia-holiday-dates.csv`. Структура минимальная: один столбец, каждая строка — дата в формате `ГГГГ-ММ-ДД` обозначает праздничный день. Вы можете самомтоятельно собрать и обновлять аналогичный файл, используя производственный календарь с Консультант+.
+
+```{r}
+#| label: hols-file
+#| message: false
+
+read.csv("_russia_holidays.csv", stringsAsFactors = FALSE) %>%
+  mutate(x = as_date(x)) %>%
+  head(10)
+
+read.csv("_russia_holidays.csv", stringsAsFactors = FALSE) %>%
+  mutate(x = as_date(x), year = year(x)) %>%
+  count(year, name = "праздничных дней")
+```
+
+Загружаем вектор дат и разворачиваем **календарь по дням** на период анализа (2013–2024):
+
+```{r}
+#| label: hols-load
+#| message: false
+
+hols <- read.csv("_russia_holidays.csv", stringsAsFactors = FALSE) %>%
+  pull(x) %>%
+  as_date()
+
+dates <- seq(as_date("2013-01-01"), as_date("2024-12-31"), by = "day")
+
+# hols_ind = 1, если день официально нерабочий; иначе 0
+hol_daily <- tibble(
+  date     = dates,
+  hols_ind = as.integer(dates %in% hols)
+)
+
+hol_daily %>% slice(1:10)
+```
+
+### 4.3 От дней к месячному регрессору `hol_new_1`
+
+X13 работает с **месячным** рядом. Нужно свернуть дневной календарь до одного числа на месяц.
+
+**Шаг 1.** Для каждого месяца считаем `holidays_share` — долю праздничных дней:
+
+$$\text{holidays\_share}_m = \frac{1}{N_m}\sum_{d \in m} \text{hols\_ind}_d,$$
+
+где $N_m$ — число календарных дней в месяце. Январь с 8 праздниками из 31 дня даёт `holidays_share ≈ 0,26`; обычный март без праздников — `0`.
+
+```{r}
+#| label: hols-monthly
+#| message: false
+
+hol_monthly <- hol_daily %>%
+  mutate(month = floor_date(date, "month")) %>%
+  reframe(
+    n_days         = n(),
+    n_holidays     = sum(hols_ind),
+    holidays_share = mean(hols_ind),
+    .by = "month"
+  )
+
+hol_monthly %>%
+  filter(month %in% as.Date(c("2013-01-01", "2013-03-01", "2013-05-01", "2024-01-01"))) %>%
+  mutate(month = format(month, "%Y-%m"))
+```
+
+**Шаг 2.** Центрируем **внутри каждого года**:
+
+$$\text{hol\_new\_1}_m = \text{holidays\_share}_m - \bar{h}_y, \qquad \bar{h}_y = \frac{1}{12}\sum_{m \in y} \text{holidays\_share}_m.$$
+
+```{r}
+#| label: hol-new-1
+#| message: false
+
+hol_new_1_tbl <- hol_monthly %>%
+  mutate(yr = floor_date(month, "year")) %>%
+  group_by(yr) %>%
+  mutate(
+    h_mean_yr         = mean(holidays_share),
+    x_centered_mean   = holidays_share - h_mean_yr
+  ) %>%
+  ungroup()
+
+hol_new_1 <- hol_new_1_tbl %>%
+  pull(x_centered_mean) %>%
+  ts(start = c(2013, 1), frequency = 12)
+
+hol_new_1_tbl %>%
+  filter(month %in% as.Date(c("2013-01-01", "2018-01-01", "2024-01-01"))) %>%
+  select(month, n_holidays, holidays_share, h_mean_yr, x_centered_mean) %>%
+  mutate(month = format(month, "%Y-%m"))
+```
+
+В январе 2013 и 2024 **разное** число праздников (`n_holidays`), но после вычитания среднего по году регрессор отвечает на вопрос: «насколько этот месяц **отличается от типичного месяца того же года** по доле выходных», а не «сколько всего было праздников в абсолютных единицах».
+
+### 4.4 Почему нельзя ограничиться `genhol()`
+
+Функция `genhol()` из пакета `seasonal` — готовый способ построить регрессор из вектора дат. При `center = "mean"` она центрирует **по всему ряду** (2013–2024), а не внутри года:
+
+```{r}
+#| label: hols-genhol
+#| message: false
+
+hols_genhol <- genhol(hols, center = "mean", frequency = 12)
+
+compare_hols <- tibble(
+  month   = seq(as.Date("2013-01-01"), by = "month", length.out = length(hol_new_1)),
+  genhol  = as.numeric(hols_genhol),
+  hol_new = as.numeric(hol_new_1)
+) %>%
+  mutate(cal_month = month(month))
+
+compare_hols %>%
+  filter(cal_month == 1) %>%
+  select(month, genhol, hol_new) %>%
+  head(5)
+```
+
+Для всех январей `genhol` даёт **одно и то же** значение: функция не видит, что в 2024 в январе было 8 праздников, а в 2013 — тоже 8, но в 2018 календарь другой. `hol_new_1` это различает: внутригодовое центрирование убирает «средний уровень выходных в этом году» и оставляет отклонения по месяцам.
+
+### 4.5 Как регрессор попадает в `seas()`
+
+Берём месячный ряд промышленного производства (логарифм индекса) и четыре спецификации. Во всех случаях вызывается `seas()` из пакета `seasonal` — обёртка над бинарником X13.
+
+| Модель | Метод | Регрессор `xreg` | Зачем |
+|--------|-------|------------------|-------|
+| `prom_s0` | SEATS | — | Базовый ряд, праздники не учтены |
+| `prom_s1` | X11 | — | То же, но фильтр X11 |
+| `prom_s2` | X11 | `hols_genhol` | Наивная поправка через `genhol()` |
+| **`prom_s3`** | **X11** | **`hol_new_1`** | **Рекомендуемый вариант** |
+
+Ключевые аргументы для моделей с календарём:
+
+- `xreg = hol_new_1` — наш месячный регрессор (объект `ts` с `frequency = 12`);
+- `regression.usertype = "holiday"` — X13 трактует столбец как **праздничный** регрессор (отдельный тип, не обычный тренд);
+- `regression.aictest = NULL` — не подбирать регрессоры автоматически, оставить только то, что задали;
+- `force.type = "denton"` — согласовать низкочастотный ряд с высокочастотным при наличии регрессоров.
+
+```{r}
+#| label: x13-calendar-models
+#| eval: false
+#| echo: true
+
+prom_raw <- read_csv("_seasonality.csv", show_col_types = FALSE) %>%
+  arrange(Date) %>%
+  pull(Prom_M) %>%
+  ts(start = c(2013, 1), frequency = 12) %>%
+  log()
+
+prom_s0 <- seas(prom_raw) %>% final()
+
+prom_s1 <- seas(prom_raw,
+                x11 = "",
+                regression.aictest = NULL,
+                force.type = "denton") %>% final()
+
+prom_s2 <- seas(prom_raw,
+                x11 = "",
+                xreg = hols_genhol,
+                regression.usertype = "holiday",
+                force.type = "denton",
+                regression.aictest = NULL) %>% final()
+
+prom_s3 <- seas(prom_raw,
+                x11 = "",
+                xreg = hol_new_1,
+                regression.usertype = "holiday",
+                force.type = "denton",
+                regression.aictest = NULL) %>% final()
+```
+
+Смысл: X13 одновременно оценивает сезонность ряда **и** коэффициент при `xreg`. Если в январе много праздников, алгоритм не списывает провал на «сезонный январский минимум», а частично объясняет его календарём. SA-ряд `prom_s3` — это уже очищенный от таких эффектов индекс; именно его мы сравниваем на графиках ниже.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-prod-cal
+#| fig-cap: "Влияние производственного календаря на SA промышленного производства"
+#| message: false
+#| warning: false
+#| fig-height: 5
+
+n_obs <- length(prom_raw)
+tibble(
+  date = seq(as.Date("2013-01-01"), by = "month", length.out = n_obs),
+  `SEATS (без праздников)` = as.numeric(prom_s0),
+  `X11 (без праздников)`   = as.numeric(prom_s1),
+  `X11 + genhol`           = as.numeric(prom_s2),
+  `X11 + hol_new_1`        = as.numeric(prom_s3)
+) %>%
+  pivot_longer(-date) %>%
+  ggplot(aes(x = date, y = value, colour = name)) +
+  geom_line(linewidth = 0.7) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_colour_manual(values = c(
+    "SEATS (без праздников)" = "grey60",
+    "X11 (без праздников)"   = "grey40",
+    "X11 + genhol"           = "#2C7BB6",
+    "X11 + hol_new_1"        = "#D7191C"
+  )) +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "log(ИПП) SA", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+:::
+
+Серая линия (`prom_s0`) — корректировка без учёта праздников: в январе алгоритм завышает уровень, приписывая провал сезонности. Синяя (`prom_s2`, `genhol`) — наивная поправка: лучше, но не учитывает годовую вариацию числа выходных. **Красная (`prom_s3`, `hol_new_1`) — рекомендуемый вариант**: доля праздничных дней в месяце с центрированием внутри года.
+
+::: {.callout-note}
+X13-ARIMA-SEATS с производственным календарём — специфика пакета `seasonal` (R) и официального бинарника Census Bureau. В Python используется обёртка `seasonalAdjustment` или вызов через subprocess. В Julia оптимальный подход — включить долю праздников как экзогенный регрессор в BSM через `StateSpaceModels.jl`, что эквивалентно по смыслу.
+:::
+
+### 4.3 Как читать разницу
+
+Чтобы увидеть величину эффекта, возьмём разность между SA-рядами с учётом праздников и без:
+
+```{r}
+#| label: fig-prod-cal-diff
+#| fig-cap: "Разница SA-рядов: с учётом праздников минус без"
+#| fig-height: 3.5
+
+n_obs <- length(prom_raw)
+tibble(
+  date   = seq(as.Date("2013-01-01"), by = "month", length.out = n_obs),
+  d_genhol = as.numeric(prom_s2) - as.numeric(prom_s0),
+  d_hol    = as.numeric(prom_s3) - as.numeric(prom_s0)
+) %>%
+  pivot_longer(-date, names_to = "method",
+               names_ptypes = list(method = factor())) %>%
+  mutate(method = recode(method,
+    d_genhol = "X11 + genhol − SEATS",
+    d_hol    = "X11 + hol_new_1 − SEATS"
+  )) %>%
+  ggplot(aes(x = date, y = value, colour = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_line(linewidth = 0.7) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_colour_manual(values = c(
+    "X11 + genhol − SEATS"    = "#2C7BB6",
+    "X11 + hol_new_1 − SEATS" = "#D7191C"
+  )) +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "Δ log(ИПП)", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+Поправка максимальна в январе–феврале и мае. Разница между `genhol` и `hol_new_1` видна в годах с нестандартным календарём (2018, 2020, 2024): именно там переносы выходных меняют долю праздничных дней в месяце, и только `prom_s3` это учитывает.
+
+---
+
+## 5. Недельные и дневные данные
+
+Стандартные методы (X11, X13, STL) разработаны для данных с одной периодичностью: квартальные (4), месячные (12). Дневные и недельные данные устроены сложнее.
+
+- **Дневные данные** имеют одновременно **годовую** ($m = 365{,}25$) и **недельную** ($m = 7$) сезонности.
+- **Недельные данные** имеют **годовую** сезонность ($m = 52{,}18$) — нецелое число периодов в году.
+
+Нецелые периоды и несколько сезонностей одновременно — это то, с чем классические методы не справляются.
+
+### 5.1 mstl(): несколько STL
+
+Функция `mstl()` из пакета `forecast` решает задачу для нескольких сезонных периодов: применяет STL последовательно для каждого из них.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-mstl
+#| fig-cap: "MSTL для дневной температуры в Нижнем Новгороде: недельная и годовая сезонности"
+#| fig-height: 7
+#| message: false
+
+temp_novosib <- read_parquet("data_temp.parquet") %>%
+  filter(town == "Нижний Новгород") %>%
+  arrange(time) %>%
+  select(time, temp) %>%
+  filter(!is.na(temp))
+
+temp_mts <- temp_novosib %>%
+  pull(temp) %>%
+  msts(seasonal.periods = c(7, 365.25))
+
+mstl(temp_mts) %>%
+  autoplot() +
+  theme_minimal(base_size = 11) +
+  labs(title = NULL)
+```
+
+#### Python
+
+```{python}
+#| label: fig-mstl-py
+#| fig-cap: "MSTL для дневной температуры (Python)"
+#| fig-height: 7
+
+temp_py = pd.read_parquet("data_temp.parquet")
+novosib_py = (
+    temp_py[temp_py["town"] == "Нижний Новгород"]
+    .sort_values("time")
+    .dropna(subset=["temp"])
+    .set_index("time")["temp"]
+    .asfreq("D")
+)
+
+mstl_res = MSTL(novosib_py, periods=[7, 365]).fit()
+
+fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
+labels = ["Исходный", "Тренд", "Сезонность (неделя)", "Сезонность (год)"]
+seas_df = mstl_res.seasonal
+series = [novosib_py.values,
+          mstl_res.trend,
+          seas_df.iloc[:, 0].values if hasattr(seas_df, 'iloc') else seas_df[:, 0],
+          seas_df.iloc[:, 1].values if hasattr(seas_df, 'iloc') else seas_df[:, 1]]
+
+for ax, s, lbl in zip(axes, series, labels):
+    ax.plot(novosib_py.index, s, lw=0.4, color="#2C7BB6")
+    ax.set_title(lbl, fontsize=10)
+
+fig.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-mstl-jl
+#| fig-cap: "Многопериодное STL для дневной температуры (Julia)"
+#| fig-height: 7
+#| message: false
+
+begin
+
+  temp_jl2 = copy(DataFrame(Parquet2.Dataset("data_temp.parquet")))
+  
+  nn_jl = filter(r -> r.town == "Нижний Новгород" && !ismissing(r.time) && !ismissing(r.temp), temp_jl2)
+  sort!(nn_jl, :time)
+  y_nn = Float64.(nn_jl.temp)
+  dates_nn = Date.(DateTime.(nn_jl.time))
+  
+  # Последовательный MSTL: сначала убираем недельную, затем годовую сезонность
+  seas_7   = stl_manual(y_nn; s=7,   t_win=ceil(Int, 0.75*length(y_nn)), s_win=5).seasonal
+  y_deseas = y_nn .- seas_7
+  decomp_y = stl_manual(y_deseas; s=365, t_win=ceil(Int, 0.75*length(y_deseas)), s_win=11)
+  
+  l4 = @layout [a; b; c; d]
+  p_raw  = plot(dates_nn, y_nn;            lw=0.3, color="#2C7BB6", title="Исходный",             legend=false, ylabel="°C")
+  p_tr   = plot(dates_nn, decomp_y.trend;  lw=0.9, color="#D7191C", title="Тренд",                legend=false, ylabel="°C")
+  p_s7   = plot(dates_nn, seas_7;          lw=0.4, color="#4DAC26", title="Сезонность (неделя)",  legend=false, ylabel="°C")
+  p_s365 = plot(dates_nn, decomp_y.seasonal; lw=0.4, color="#E08214", title="Сезонность (год)", legend=false, ylabel="°C")
+  plot(p_raw, p_tr, p_s7, p_s365; layout=l4, size=(900, 800),
+       left_margin=5Plots.mm, bottom_margin=2Plots.mm)
+
+end
+```
+
+:::
+
+В выводе видны три компоненты: тренд (небольшой), недельная сезонность (слабая — дневные температуры мало меняются по дням недели) и годовая сезонность (доминирующая, около ±25°C). Остаток содержит случайные погодные флуктуации.
+
+### 5.2 Ряды Фурье
+
+Для недельных или дневных данных STL с нецелыми периодами работает, но медленно и не всегда стабильно. Более гибкий подход — аппроксимировать сезонность рядом Фурье:
+
+$$y_t = \alpha_0 + \sum_{k=1}^{K} \left[ \alpha_k \sin\!\left(\frac{2\pi k t}{m}\right) + \beta_k \cos\!\left(\frac{2\pi k t}{m}\right) \right] + \varepsilon_t,$$
+
+где $m$ — период (может быть нецелым), $K$ — число гармоник. В R гармоники строятся функцией `fourier()` из пакета `forecast` и включаются в ARIMA как экзогенные регрессоры (`auto.arima(..., xreg = ...)`). В Python — класс `Fourier` из `statsmodels.tsa.deterministic`, встроенный в `ARIMA` через матрицу `exog`. Остаток $\varepsilon_t$ моделируется ARIMA-процессом, а не отдельной OLS-регрессией.
+
+Чем выше $K$, тем более детальная форма сезонности захватывается. Оптимальное $K$ выбирается по AIC. Преимущества перед STL:
+
+- Работает с нецелыми периодами без модификаций.
+- Позволяет встроить сезонность в любую регрессионную или ARIMA-модель.
+- Вычислительно легко.
+
+Используем недельные данные о ценах из публикаций Росстата. Огурцы — идеальный пример: цена падает в несколько раз с апреля по июль (сезон отечественных тепличных огурцов) и возвращается к зимнему уровню к ноябрю. Паттерн повторяется каждый год, но форма кривой немного меняется.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-fourier
+#| fig-cap: "Недельные цены на огурцы (Росстат) и аппроксимация сезонности рядами Фурье"
+#| message: false
+#| warning: false
+
+# Недельные цены на огурцы: сильная годовая сезонность (весной дешевеют, зимой дорожают)
+ipc <- read_parquet("ipc_weekly_tidy.parquet") %>%
+  filter(category == "Огурцы свежие, кг") %>%
+  arrange(date) %>%
+  filter(!is.na(value))
+
+# msts: ряд с одной сезонностью, период = 52.18 недели ≈ 1 календарный год
+# Дробный период нужен, потому что в году не ровно 52 недели
+ipc_ts <- ipc %>%
+  pull(value) %>%
+  msts(start = c(2022, 1), seasonal.periods = 52.18)
+
+# Выбор числа гармоник K по AIC: K — сколько пар (sin, cos) входит в аппроксимацию
+# Чем больше K, тем гибче форма сезонной кривой, но больше параметров
+best_k <- 1:5 %>%
+  map(\(k) {
+    # fourier() строит матрицу столбцов sin(2πkt/m) и cos(2πkt/m), k = 1,…,K
+    xr <- fourier(ipc_ts, K = k)
+    # ARIMA с экзогенными регрессорами: y_t = S_t + ε_t, где S_t — линейная комбинация Фурье
+    # seasonal = FALSE: сезонность уже задана через Фурье, не через SARIMA
+    fit <- auto.arima(ipc_ts, xreg = xr, seasonal = FALSE, stepwise = TRUE)
+    tibble(K = k, AIC = AIC(fit))
+  }) %>%
+  list_rbind() %>%
+  slice_min(AIC, n = 1) %>%
+  pull(K)
+
+# Финальная оценка с оптимальным K
+xreg_best <- fourier(ipc_ts, K = best_k)
+fit_best  <- auto.arima(ipc_ts, xreg = xreg_best, seasonal = FALSE)
+
+# Извлекаем только сезонную компоненту Ŝ_t = X_t * β̂_фурье
+# coef() содержит и AR/MA-коэффициенты — берём только столбцы из xreg_best
+seas      <- as.numeric(xreg_best %*% coef(fit_best)[colnames(xreg_best)])
+
+# Серая линия — исходный ряд; красная — оценённая годовая сезонность
+ipc %>%
+  mutate(seas = seas) %>%
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = value), colour = "grey60", linewidth = 0.4) +
+  geom_line(aes(y = seas),  colour = "#D7191C", linewidth = 0.9) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  theme_minimal(base_size = 12) +
+  labs(x = NULL, y = "Цена, руб/кг",
+       subtitle = paste0("fourier() + auto.arima(), K = ", best_k))
+```
+
+#### Python
+
+```{python}
+#| label: fig-fourier-py
+#| fig-cap: "Недельный ИПЦ: Фурье-аппроксимация (Python)"
+
+# Те же недельные цены на огурцы, что и в R
+ipc_all = (pd.read_parquet("ipc_weekly_tidy.parquet")
+           .query("category == 'Огурцы свежие, кг'")
+           .sort_values("date")
+           .dropna(subset=["value"])
+           .reset_index(drop=True))
+
+y = ipc_all["value"].values
+idx = pd.RangeIndex(len(y))   # нумерация наблюдений t = 0, 1, …, n−1
+
+# Перебор K = 1,…,5; выбираем K с минимальным AIC (аналог map + slice_min в R)
+best_k, best_aic = 1, np.inf
+for k in range(1, 6):
+    # Fourier(order=k) — аналог fourier(..., K=k): k пар sin/cos с периодом 52.18
+    fourier = Fourier(period=52.18, order=k)
+    # DeterministicProcess собирает матрицу экзогенных регрессоров exog
+    dp = DeterministicProcess(idx, constant=False, order=0, additional_terms=[fourier])
+    exog = dp.in_sample()
+    # ARIMA(1,0,0) + Фурье: y_t = S_t + AR(1)-ошибка
+    # (в R порядок ARIMA подбирает auto.arima; здесь зафиксирован AR(1))
+    res = ARIMA(y, order=(1, 0, 0), trend="n", exog=exog).fit()
+    if res.aic < best_aic:
+        best_k, best_aic = k, res.aic
+
+# Финальная оценка с лучшим K
+fourier = Fourier(period=52.18, order=best_k)
+dp = DeterministicProcess(idx, constant=False, order=0, additional_terms=[fourier])
+exog = dp.in_sample()
+fit = ARIMA(y, order=(1, 0, 0), trend="n", exog=exog).fit()
+
+# Ŝ_t: только коэффициенты при столбцах Фурье (не AR-коэффициент ar.L1)
+seas = exog.values @ fit.params[exog.columns].values
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(ipc_all["date"].values, y,    lw=0.4, color="grey",    label="Исходный")
+ax.plot(ipc_all["date"].values, seas, lw=1.0, color="#D7191C",
+        label=f"Fourier + ARIMA, K={best_k}")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.set_ylabel("Цена, руб/кг")
+ax.legend()
+fig.tight_layout()
+plt.show()
+```
+
+#### Julia
+
+```{julia}
+#| label: fig-fourier-jl
+#| fig-cap: "Фурье-базис: что стоит за fourier() и Fourier() (Julia)"
+
+begin
+
+  # Учебная иллюстрация: что делает fourier() / Fourier() «под капотом»
+  # Базис из K пар (sin, cos) с периодом m: столбцы sin(2πkt/m), cos(2πkt/m)
+  fourier_basis(t, m, K) = reduce(hcat, [fn.(2π .* k .* t ./ m) for k in 1:K for fn in (sin, cos)])
+  
+  ipc_jl = copy(DataFrame(Parquet2.Dataset("ipc_weekly_tidy.parquet")))
+  filter!(r -> r.category == "Огурцы свежие, кг" && !ismissing(r.value) && !ismissing(r.date), ipc_jl)
+  sort!(ipc_jl, :date)
+  
+  y    = collect(skipmissing(ipc_jl.value))   # цены, руб/кг
+  t    = 1:length(y)                          # индекс наблюдения
+  m, K = 52.18, 3                             # период (недели/год), число гармоник
+  
+  X    = fourier_basis(t, m, K)   # матрица регрессоров (аналог xreg / exog)
+  β    = X \ y                    # коэффициенты гармоник: проекция y на span(X)
+  seas = X * β                    # Ŝ_t = линейная комбинация базисных функций
+  
+  plot(collect(skipmissing(ipc_jl.date)), [y seas];
+       label=["Исходный" "Фурье K=$K"],
+       lw=[0.4 1.0], color=["grey60" "#D7191C"],
+       ylabel="Цена, руб/кг", legend=:topright,
+       size=(800, 600))
+
+end
+```
+
+:::
+
+Красная линия — аппроксимация сезонности рядами Фурье. Летний обвал цен (апрель–июль) и зимний максимум хорошо аппроксимируются небольшим числом гармоник. Фурье-представление гибко захватывает асимметричный годовой паттерн: зимний «пик» более плоский, летний провал — острый.
+
+### 5.3 Prophet
+
+Prophet (Taylor & Letham, 2018) — модель Facebook для прогнозирования временных рядов с несколькими сезонностями и точками структурного перелома (changepoints). Модель аддитивна:
+
+$$y_t = g(t) + s(t) + h(t) + \varepsilon_t,$$
+
+где:
+
+- $g(t)$ — кусочно-линейный или логистический тренд с автоматически найденными точками перелома.
+- $s(t)$ — сезонность, представленная рядами Фурье (с настраиваемым $K$).
+- $h(t)$ — эффекты праздников (задаются вручную как список дат).
+- $\varepsilon_t \sim \mathcal{N}(0, \sigma^2)$ — остаток.
+
+Главное достоинство Prophet — простота спецификации для сложных данных: дневные ряды с несколькими сезонностями, праздниками, пропусками.
+
+::: {.panel-tabset}
+
+#### R
+
+```{r}
+#| label: fig-prophet-r
+#| fig-cap: "Prophet: декомпозиция дневной температуры в Нижнем Новгороде"
+#| message: false
+#| warning: false
+
+library(prophet)
+
+df_prophet <- read_parquet("data_temp.parquet") %>%
+  filter(town == "Нижний Новгород") %>%
+  arrange(time) %>%
+  select(ds = time, y = temp) %>%
+  mutate(ds = as_date(ds)) %>%
+  filter(!is.na(y))
+
+m_prophet <- prophet(
+  df_prophet,
+  yearly.seasonality  = T, # Циклы с периодичностью 1 год
+  weekly.seasonality  = F, # Циклы с периодичностью неделя
+  daily.seasonality   = F, # Циклы с периодичностью 1 день (для внутридневных данных)
+  seasonality.mode    = "additive"
+)
+
+future  <- make_future_dataframe(m_prophet, periods = 90)
+fc      <- predict(m_prophet, future)
+
+prophet_plot_components(m_prophet, fc)
+```
+
+#### Python
+
+```{python}
+#| label: fig-prophet-py
+#| fig-cap: "Prophet: декомпозиция дневной температуры (Python)"
+#| message: false
+#| warning: false
+#| eval: false
+
+from prophet import Prophet
+
+temp_py2 = pd.read_parquet("data_temp.parquet")
+novosib_prophet = (
+    temp_py2[temp_py2["town"] == "Нижний Новгород"]
+    .sort_values("time")
+    .dropna(subset=["temp"])
+    .rename(columns={"time": "ds", "temp": "y"})
+    [["ds", "y"]]
+)
+novosib_prophet["ds"] = pd.to_datetime(novosib_prophet["ds"]).dt.normalize()
+
+m_py = Prophet(
+    yearly_seasonality = True, # Циклы с периодичностью 1 год
+    weekly_seasonality = False, # Циклы с периодичностью неделя
+    daily_seasonality = False, # Циклы с периодичностью 1 день (для внутридневных данных)
+    seasonality_mode = "additive"
+)
+m_py.fit(novosib_prophet)
+
+future_py = m_py.make_future_dataframe(periods=90)
+forecast_py = m_py.predict(future_py)
+
+fig = m_py.plot_components(forecast_py)
+plt.tight_layout()
+plt.show()
+```
+
+:::
+
+На графике компонент — тренд, чёткая годовая сезонность с летним максимумом и зимним минимумом.
+
+---
+
+## Итог
+
+Каждый метод занимает свою нишу:
+
+| Метод | Когда использовать |
+|---|---|
+| **STL** | Быстрый разведочный анализ, ежедневный мониторинг, нестандартная частота. |
+| **X11/X13** | Экономическая статистика, месячные и квартальные ряды, нужна надёжность и воспроизводимость. |
+| **X11 + производственный календарь** | Экономические данные для России, где январь и май — месяцы с малым кол-вом рабочих дней. |
+| **Ряды Фурье + ARIMA** | Недельные и дневные данные. |
+| **Prophet** | Дневные ряды с несколькими сезонностями, праздниками, структурными переломами; когда нужен быстрый прогноз (из коробочки) с интерпретируемыми компонентами. |
+
+На практике X13 — золотой стандарт для макроэкономических рядов. Prophet и Фурье — удобные инструменты для оперативного анализа дневных данных там, где X13 не предназначен. Julia выделяется тем, что сложные алгоритмы — от LOESS до BSM — реализуются в ней легко, без потери читаемости и без компромисса в производительности.
+
+---
+
+## 6. Бенчмарк скорости
+
+В отдельных файлах я реализовал бенчмарки скрорсти для всех алгоритмов в статье. Для бенчмарков использовались данные
+
+* Розничные продажи пива (квартальные + мало наблюдений)
+* Промпроизводство (месячные + среднее кол-во наблюдений)
+* Температуры (дневные + тысячи наблюдений)
+
+В таблице видно как алгоритмы показывают себя с ростом кол-ва наблюдений.
+
+```{r}
+#| label: benchmark-table
+#| message: false
+
+library(kableExtra)
+
+if (!file.exists("benchmark_results.csv")) {
+  knitr::asis_output(
+    "<p><em>Таблица не сгенерирована. Запустите <code>Rscript run_benchmarks.R</code> в каталоге <code>Seasonality/</code>.</em></p>"
+  )
+} else {
+
+benchmark_df <- read_csv("benchmark_results.csv", show_col_types = FALSE)
+
+bench_show <- benchmark_df %>%
+  mutate(
+    `Время, с` = sprintf("%.3f", time_sec),
+    `× к мин.` = rel_min
+  ) %>%
+  select(
+    Ряд = series, `n`, Периодичность = periodicity, Метод = method,
+    Язык = lang, Пакет = package, Тип = impl_type,
+    `Время, с`, `× к мин.`, Примечание = note
+  )
+
+idx_prom <- which(benchmark_df$series == "Промышленное производство")
+idx_beer <- which(benchmark_df$series == "Розничные продажи пива")
+idx_temp <- which(benchmark_df$series == "Температура, Н. Новгород")
+fast_rows <- which(benchmark_df$rel_min == 1)
+
+bench_show %>%
+  kableExtra::kbl(
+    align = c("l", "r", "l", "l", "l", "l", "l", "r", "r", "l"),
+    format = "html",
+    caption = "Бенчмарк: медианное время подгонки моделей (секунды)"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = TRUE,
+    font_size = 13,
+    position = "center"
+  ) %>%
+  kableExtra::scroll_box(width = "100%", height = "520px") %>%
+  kableExtra::column_spec(8, color = "#1a5276", bold = TRUE) %>%
+  kableExtra::column_spec(9, bold = TRUE,
+    color = ifelse(benchmark_df$rel_min <= 2, "#145a32", "#7b241c")) %>%
+  kableExtra::row_spec(fast_rows, background = "#eafaf1") %>%
+  kableExtra::pack_rows("Промышленное производство", min(idx_prom), max(idx_prom)) %>%
+  kableExtra::pack_rows("Розничные продажи пива", min(idx_beer), max(idx_beer)) %>%
+  kableExtra::pack_rows("Температура, Н. Новгород", min(idx_temp), max(idx_temp)) %>%
+  kableExtra::footnote(
+    general = paste(
+      "Зелёная строка — быстрейший метод в ряду (× к мин. = 1).",
+      "Julia на температуре: подвыборка 365 дней; MSTL — s=7 + s=52.",
+      "Обновление: Rscript run_benchmarks.R."
+    ),
+    general_title = "Примечание:",
+    footnote_as_chunk = TRUE
+  )
+}
+```
